@@ -276,21 +276,29 @@
   function extractParentPostId(text) {
     const raw = String(text || '').trim();
     if (!raw) return '';
+    const cleaned = raw.replace(/^['"\s]+|['"\s]+$/g, '');
+    if (!cleaned) return '';
     const api = getParentMemoryApi();
     if (api && typeof api.extractParentPostId === 'function') {
       try {
-        return String(api.extractParentPostId(raw) || '').trim();
+        const viaApi = String(api.extractParentPostId(cleaned) || '').trim();
+        if (viaApi) return viaApi;
       } catch (e) {
         // ignore
       }
     }
-    const direct = raw.match(/^[0-9a-fA-F-]{32,36}$/);
+    const queryId = cleaned.match(/[?&#](?:parent_post_id|parentPostId|post_id|postId)=([0-9A-Za-z_-]{4,128})(?:[&#]|$)/i);
+    if (queryId) return queryId[1];
+    // 兼容非 UUID 形态的 postId（例如纯数字或短横线/下划线组合）
+    const direct = cleaned.match(/^[0-9A-Za-z_-]{4,128}$/);
     if (direct) return direct[0];
-    const generated = raw.match(/\/generated\/([0-9a-fA-F-]{32,36})(?:\/|$)/);
+    const generated = cleaned.match(/\/generated\/([0-9A-Za-z_-]{4,128})(?:[/?#]|$)/);
     if (generated) return generated[1];
-    const imaginePublic = raw.match(/\/imagine-public\/images\/([0-9a-fA-F-]{32,36})(?:\.jpg|\/|$)/);
+    const imaginePublic = cleaned.match(/\/imagine-public\/images\/([0-9A-Za-z_-]{4,128})(?:\.[A-Za-z0-9]+|[/?#]|$)/);
     if (imaginePublic) return imaginePublic[1];
-    const all = raw.match(/([0-9a-fA-F-]{32,36})/g);
+    const imagesTail = cleaned.match(/\/images\/([0-9A-Za-z_-]{4,128})(?:\.[A-Za-z0-9]+|[/?#]|$)/);
+    if (imagesTail) return imagesTail[1];
+    const all = cleaned.match(/([0-9A-Za-z_-]{4,128})/g);
     return all && all.length ? all[all.length - 1] : '';
   }
 
@@ -375,20 +383,26 @@
   function applyParentPostReference(text, options = {}) {
     const silent = Boolean(options.silent);
     const resolved = resolveReferenceByText(text);
-    if (!resolved.parentPostId || !(resolved.url || resolved.sourceUrl)) {
+    const raw = String(text || '').trim();
+    const fallbackId = extractParentPostId(raw);
+    const fallbackUrl = fallbackId ? pickSourceUrl({ sourceImageUrl: raw }, fallbackId, raw) : '';
+    const finalParentId = resolved.parentPostId || fallbackId;
+    const finalSourceUrl = resolved.sourceUrl || fallbackUrl;
+    const finalPreviewUrl = resolved.url || finalSourceUrl;
+    if (!finalParentId || !finalPreviewUrl) {
       if (!silent) {
         toast('未识别到有效 parentPostId', 'warning');
       }
       return false;
     }
     if (imageUrlInput) {
-      imageUrlInput.value = resolved.sourceUrl || resolved.url;
+      imageUrlInput.value = finalSourceUrl || finalPreviewUrl;
     }
     if (parentPostInput) {
-      parentPostInput.value = resolved.parentPostId;
+      parentPostInput.value = finalParentId;
     }
     clearFileSelection();
-    setReferencePreview(resolved.url || resolved.sourceUrl, resolved.parentPostId);
+    setReferencePreview(finalPreviewUrl, finalParentId);
     if (!silent) {
       toast('已使用 parentPostId 填充参考图', 'success');
     }

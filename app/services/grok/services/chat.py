@@ -524,10 +524,11 @@ class StreamProcessor(proc_base.BaseProcessor):
             AsyncGenerator[str, None], async generator of strings
         """
         idle_timeout = get_config("chat.stream_timeout")
+        first_item_timeout = get_config("chat.first_token_timeout")
 
         try:
             async for line in proc_base._with_idle_timeout(
-                response, idle_timeout, self.model
+                response, idle_timeout, self.model, first_item_timeout
             ):
                 line = proc_base._normalize_line(line)
                 if not line:
@@ -714,10 +715,11 @@ class CollectProcessor(proc_base.BaseProcessor):
         fingerprint = ""
         content = ""
         idle_timeout = get_config("chat.stream_timeout")
+        first_item_timeout = get_config("chat.first_token_timeout")
 
         try:
             async for line in proc_base._with_idle_timeout(
-                response, idle_timeout, self.model
+                response, idle_timeout, self.model, first_item_timeout
             ):
                 line = proc_base._normalize_line(line)
                 if not line:
