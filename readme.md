@@ -216,8 +216,28 @@ Vercel 部署建议：
 
 - 必设 `DATA_DIR=/tmp/data`
 - 建议设 `LOG_FILE_ENABLED=false`
-- 如需持久化数据，不要使用 `local`，改为外部 `redis/mysql/pgsql`
+- 不建议使用 `local` 保存长期状态
+- 推荐直接使用外部 `redis/mysql/pgsql` 保存配置、Token 和运行状态
 - 如需前端工作台，建议同时设置 `PUBLIC_ENABLED=true` 和 `PUBLIC_KEY`
+
+推荐环境变量：
+
+```env
+LOG_LEVEL=INFO
+LOG_FILE_ENABLED=false
+DATA_DIR=/tmp/data
+SERVER_STORAGE_TYPE=redis
+SERVER_STORAGE_URL=redis://:password@host:6379/0
+PUBLIC_ENABLED=true
+PUBLIC_KEY=your-own-long-random-key
+```
+
+如果你使用 PostgreSQL，也可以改成：
+
+```env
+SERVER_STORAGE_TYPE=pgsql
+SERVER_STORAGE_URL=postgresql+asyncpg://user:password@host:5432/db
+```
 
 适用场景：
 
@@ -228,7 +248,9 @@ Vercel 部署建议：
 注意：
 
 - Vercel 的本地磁盘是临时的
+- 后台保存的配置如果依赖 `local`，在冷启动或实例切换后可能恢复默认值
 - 大量视频/图片缓存不适合长期放在 `local`
+- 如果你要长期使用管理后台、Public 页面和工作台，建议从一开始就配置远程存储
 
 ## Render 部署
 
