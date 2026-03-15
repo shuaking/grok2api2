@@ -496,6 +496,51 @@ class VideoService:
             await upload_service.close()
         return uploaded
 
+    async def _prepare_reference_video_inputs(
+        self,
+        token: str,
+        reference_items: list[dict[str, Any]],
+    ) -> tuple[str, list[dict[str, str]]]:
+        primary_parent_post_id = ""
+        prepared_items: list[dict[str, str]] = []
+        upload_candidates: list[dict[str, Any]] = []
+
+        for index, item in enumerate(reference_items):
+            normalized_item = dict(item or {})
+            source_url = await self._resolve_reference_source_url(token, normalized_item)
+            if not source_url:
+                raise ValidationException(f"第 {index + 1} 张参考图缺少可用来源")
+
+            current_parent_post_id = str(
+                normalized_item.get("parent_post_id") or ""
+            ).strip()
+            mention_alias = str(normalized_item.get("mention_alias") or "").strip()
+
+            if current_parent_post_id and not primary_parent_post_id:
+                primary_parent_post_id = current_parent_post_id
+                prepared_items.append(
+                    {
+                        "file_id": current_parent_post_id,
+                        "asset_url": source_url,
+                        "source_url": source_url,
+                        "parent_post_id": current_parent_post_id,
+                        "mention_alias": mention_alias,
+                        "direct_parent": "1",
+                    }
+                )
+                continue
+
+            normalized_item["source_image_url"] = source_url
+            upload_candidates.append(normalized_item)
+
+        if upload_candidates:
+            uploaded_items = await self._upload_reference_items(token, upload_candidates)
+            for item in uploaded_items:
+                item["direct_parent"] = "0"
+            prepared_items.extend(uploaded_items)
+
+        return primary_parent_post_id, prepared_items
+
     async def generate_from_reference_items(
         self,
         token: str,
@@ -507,7 +552,9 @@ class VideoService:
         preset: str = "normal",
     ) -> AsyncGenerator[bytes, None]:
         token_tag = _token_tag(token)
-        uploaded_refs = await self._upload_reference_items(token, reference_items)
+        primary_parent_post_id, uploaded_refs = await self._prepare_reference_video_inputs(
+            token, reference_items
+        )
         if not uploaded_refs:
             raise ValidationException("至少需要 1 张参考图")
 
@@ -539,13 +586,13 @@ class VideoService:
         file_attachments = [
             str(item.get("file_id") or "").strip()
             for item in uploaded_refs
-            if str(item.get("file_id") or "").strip()
+            if str(item.get("file_id") or "").strip() and str(item.get("direct_parent") or "") != "1"
         ]
         message = f"{prompt_text} --mode=custom".strip()
         model_config_override = {
             "modelMap": {
                 "videoGenModelConfig": {
-                    "parentPostId": post_id,
+                    "parentPostId": primary_parent_post_id or post_id,
                     "aspectRatio": aspect_ratio,
                     "videoLength": video_length,
                     "resolutionName": resolution,

@@ -712,6 +712,17 @@
     return `https://imagine-public.x.ai/imagine-public/images/${parentPostId}.jpg`;
   }
 
+  function isImagePreviewUrl(value) {
+    const raw = String(value || '').trim();
+    if (!raw) return false;
+    if (raw.startsWith('data:image/')) return true;
+    if (/\/imagine-public\/images\/[0-9a-fA-F-]{32,36}(?:\.[A-Za-z0-9]+|[/?#]|$)/i.test(raw)) return true;
+    if (/\/v1\/files\/image\//i.test(raw)) return true;
+    if (/\/users\/.+\.(?:jpg|jpeg|png|webp)(?:[?#].*)?$/i.test(raw)) return true;
+    if (/\.(?:jpg|jpeg|png|webp)(?:[?#].*)?$/i.test(raw)) return true;
+    return false;
+  }
+
   function pickPreviewUrl(hit, parentPostId, fallbackValue = '') {
     const candidates = [
       hit && hit.imageUrl,
@@ -722,7 +733,7 @@
     ];
     for (const candidate of candidates) {
       const raw = String(candidate || '').trim();
-      if (raw) return raw;
+      if (isImagePreviewUrl(raw)) return raw;
     }
     return pickSourceUrl(hit, parentPostId, fallbackValue);
   }
@@ -921,6 +932,48 @@
     renderReferenceStrip();
     setReferencePreviewItems(referenceImages);
     syncPromptRichInputFromTextarea();
+  }
+
+  function appendReferenceItems(items, mode = 'upload') {
+    const candidates = (Array.isArray(items) ? items : [])
+      .filter((item) => item && (item.previewUrl || item.sourceUrl || item.url))
+      .map((item) => ({
+        ...item,
+        parentPostId: String(item.parentPostId || '').trim(),
+        sourceUrl: String(item.sourceUrl || item.url || '').trim(),
+        url: String(item.url || item.sourceUrl || '').trim()
+      }));
+    if (!candidates.length) return false;
+
+    const merged = Array.isArray(referenceImages) ? referenceImages.slice() : [];
+    let appended = false;
+    for (const item of candidates) {
+      const itemParentId = String(item.parentPostId || '').trim();
+      const itemSourceUrl = String(item.sourceUrl || item.url || '').trim();
+      const exists = merged.some((current) => {
+        const currentParentId = String(current.parentPostId || '').trim();
+        const currentSourceUrl = String(current.sourceUrl || current.url || '').trim();
+        if (itemParentId && currentParentId && itemParentId === currentParentId) return true;
+        if (itemSourceUrl && currentSourceUrl && itemSourceUrl === currentSourceUrl) return true;
+        return false;
+      });
+      if (exists) {
+        continue;
+      }
+      if (merged.length >= REFERENCE_LIMIT) {
+        toast(`最多支持 ${REFERENCE_LIMIT} 张参考图`, 'warning');
+        break;
+      }
+      merged.push(item);
+      appended = true;
+    }
+
+    if (!appended) return false;
+    setReferenceItems(
+      merged,
+      merged.some((item) => String(item.parentPostId || '').trim()) ? 'parent_post' : mode
+    );
+    return true;
   }
 
   function hideReferenceMentionMenu() {
@@ -1322,6 +1375,7 @@
 
   function applyParentPostReference(text, options = {}) {
     const silent = Boolean(options.silent);
+    const append = Boolean(options.append);
     const resolved = resolveReferenceByText(text);
     const raw = String(text || '').trim();
     const fallbackId = extractParentPostId(raw);
@@ -1336,16 +1390,21 @@
       }
       return false;
     }
-    setReferenceItems([{
+    const targetItem = {
       id: makeReferenceId('parent'),
       previewUrl: finalPreviewUrl,
       sourceUrl: finalSourceUrl || finalPreviewUrl,
       url: finalPreviewUrl,
       parentPostId: finalParentId,
       name: finalParentId || 'parentPostId'
-    }], 'parent_post');
+    };
+    if (append) {
+      appendReferenceItems([targetItem], 'parent_post');
+    } else {
+      setReferenceItems([targetItem], 'parent_post');
+    }
     if (!silent) {
-      toast('已使用 parentPostId 填充参考图', 'success');
+      toast(append ? '已追加参考图' : '已使用 parentPostId 填充参考图', 'success');
     }
     return true;
   }
@@ -3299,7 +3358,7 @@
 
   if (applyParentBtn) {
     applyParentBtn.addEventListener('click', () => {
-      applyParentPostReference(parentPostInput ? parentPostInput.value : '');
+      applyParentPostReference(parentPostInput ? parentPostInput.value : '', { append: true });
     });
   }
 
@@ -3307,7 +3366,7 @@
     parentPostInput.addEventListener('keydown', (event) => {
       if (event.key === 'Enter') {
         event.preventDefault();
-        applyParentPostReference(parentPostInput.value);
+        applyParentPostReference(parentPostInput.value, { append: true });
       }
     });
     parentPostInput.addEventListener('input', () => {
@@ -3326,7 +3385,7 @@
       event.preventDefault();
       event.stopPropagation();
       parentPostInput.value = text;
-      applyParentPostReference(text, { silent: true });
+      applyParentPostReference(text, { silent: true, append: true });
     });
   }
 
@@ -3368,13 +3427,13 @@
       event.preventDefault();
       event.stopPropagation();
       imageUrlInput.value = text;
-      const applied = applyParentPostReference(text, { silent: true });
+      const applied = applyParentPostReference(text, { silent: true, append: true });
       if (!applied) {
         const resolved = resolveReferenceByText(text);
         if (resolved.parentPostId && parentPostInput) {
           parentPostInput.value = resolved.parentPostId;
         }
-        setReferenceItems([{
+        appendReferenceItems([{
           id: makeReferenceId('url'),
           previewUrl: resolved.url || resolved.sourceUrl || text,
           sourceUrl: resolved.sourceUrl || text,
@@ -3409,7 +3468,7 @@
     if (!isTypingInParentInput && !isTypingInImageUrlInput && (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || target?.isContentEditable)) {
       return;
     }
-    const applied = applyParentPostReference(text, { silent: true });
+    const applied = applyParentPostReference(text, { silent: true, append: true });
     if (applied) {
       event.preventDefault();
     }

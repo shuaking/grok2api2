@@ -362,14 +362,17 @@ async def public_video_start(data: VideoStartRequest):
         raise HTTPException(status_code=400, detail="最多支持 7 张参考图")
     parent_post_refs = [item for item in reference_items if item.get("parent_post_id")]
     parent_post_id = str(parent_post_refs[0].get("parent_post_id") or "").strip() if parent_post_refs else ""
+    # 带 parent_post_id 的参考项按“基于已有 post 引用”处理，不再同时抽取 image_url，
+    # 避免单个 reference_item 既有 parent_post_id 又有 image_url 时被误判为冲突参数。
+    pure_image_refs = [item for item in reference_items if not item.get("parent_post_id")]
     image_url = (
-        str(reference_items[0].get("image_url") or "").strip() or None
-        if reference_items
+        str(pure_image_refs[0].get("image_url") or "").strip() or None
+        if pure_image_refs
         else None
     )
     source_image_url = (
-        str(reference_items[0].get("source_image_url") or "").strip() or None
-        if reference_items
+        str(pure_image_refs[0].get("source_image_url") or "").strip() or None
+        if pure_image_refs
         else None
     )
 
