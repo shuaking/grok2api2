@@ -138,7 +138,10 @@
       const entry = createMessage(msg.role, text);
       if (entry && msg.role === 'assistant') {
         entry.sources = msg.sources || null;
+        entry.rendering = msg.rendering || null;
         updateMessage(entry, text, true);
+      } else if (entry && msg.role === 'user') {
+        renderUserMessage(entry, text, []);
       }
     }
     if (activeStreamInfo && activeStreamInfo.sessionId === session.id && activeStreamInfo.entry.row) {
@@ -594,7 +597,175 @@
       .map((item) => normalizeSourceText(item.label || item.hostname || item.href || ''))
       .filter(Boolean);
     const titleAttr = titles.length ? ` title="${escapeHtml(titles.join('\n'))}"` : '';
-    return `<span class="inline print-hidden"><span class="inline"><a href="${href}" target="_blank" rel="noopener noreferrer nofollow" class="citation inline-citation-chip no-copy inline text-nowrap print-hidden"${titleAttr} data-state="closed"><span class="inline-citation-chip__label">${label}</span>${extraCount > 0 ? `<span class="inline-citation-chip__count">+${extraCount}</span>` : ''}</a></span></span>`;
+    if (extraCount <= 0) {
+      return `<span class="inline print-hidden"><span class="inline"><a href="${href}" target="_blank" rel="noopener noreferrer nofollow" class="citation inline-citation-chip no-copy inline text-nowrap print-hidden"${titleAttr} data-state="closed"><span class="inline-citation-chip__label">${label}</span></a></span></span>`;
+    }
+    const payload = escapeHtml(encodeURIComponent(JSON.stringify(items.map((item) => ({
+      href: String(item && item.href || '').trim(),
+      hostname: normalizeSourceText(item && item.hostname || ''),
+      label: normalizeSourceText(item && item.label || '')
+    })))));
+    return `<span class="inline print-hidden"><span class="inline"><a href="${href}" target="_blank" rel="noopener noreferrer nofollow" class="citation inline-citation-chip inline-citation-cluster no-copy inline text-nowrap print-hidden" data-state="closed" data-citation-links="${payload}"${titleAttr}><span class="inline-citation-chip__label">${label}</span><span class="inline-citation-chip__count">+${extraCount}</span></a></span></span>`;
+  }
+
+  function expandInlineCitationCluster(cluster) {
+    if (!(cluster instanceof HTMLElement)) return;
+    if (cluster.dataset.expanded === '1') return;
+    const raw = cluster.dataset.citationLinks || '';
+    if (!raw) return;
+    try {
+      const links = JSON.parse(decodeURIComponent(raw));
+      if (!Array.isArray(links) || !links.length) return;
+      const expanded = links
+        .map((item) => buildInlineCitationChip([item]))
+        .filter(Boolean)
+        .join('');
+      if (!expanded) return;
+      const wrapper = document.createElement('span');
+      wrapper.className = 'inline print-hidden inline-citation-cluster-expanded';
+      wrapper.innerHTML = expanded;
+      cluster.replaceWith(wrapper);
+    } catch (e) {
+      // ignore malformed payload
+    }
+  }
+
+  function parseRenderingCards(rendering) {
+    const rawModelResponse = rendering && rendering.rawModelResponse && typeof rendering.rawModelResponse === 'object'
+      ? rendering.rawModelResponse
+      : null;
+    const rawCards = Array.isArray(rawModelResponse && rawModelResponse.cardAttachmentsJson)
+      ? rawModelResponse.cardAttachmentsJson
+      : [];
+    const cardMap = new Map();
+    rawCards.forEach((raw) => {
+      if (typeof raw !== 'string' || !raw.trim()) return;
+      try {
+        const card = JSON.parse(raw);
+        if (!card || typeof card !== 'object' || !card.id) return;
+        cardMap.set(String(card.id), card);
+      } catch (e) {
+        // ignore malformed cards
+      }
+    });
+    return cardMap;
+  }
+
+  function buildRenderedImageMarkdown(card) {
+    const image = card && card.image && typeof card.image === 'object' ? card.image : {};
+    const original = String(image.original || image.link || '').trim();
+    if (!original) return '';
+    const title = normalizeSourceText(image.title || '') || 'image';
+    return `\n![${title}](${original})\n`;
+  }
+
+  function normalizeRenderedMarkdownLayout(text) {
+    let output = String(text || '');
+    output = output.replace(/([^\n])\s*(#{2,6}\s+)/g, '$1\n\n$2');
+    output = output.replace(/(<\/span><\/span>)\s*(#{2,6}\s+)/g, '$1\n\n$2');
+    output = output.replace(/(<\/span><\/span>)\s*(\d+\.\s+)/g, '$1\n\n$2');
+    output = output.replace(/(<\/span><\/span>)\s*([*-]\s+)/g, '$1\n\n$2');
+    output = output.replace(/(<\/span><\/span>)\s*(\*\*[^*]+\*\*:)/g, '$1\n\n$2');
+    output = output.replace(/([。！？；])\s*(\d+\.\s+)/g, '$1\n\n$2');
+    output = output.replace(/([。！？；])\s*([*-]\s+)/g, '$1\n\n$2');
+    output = output.replace(/([^\n])\s*(?:[-*•]\s+\*\*[^*]+\*\*:)/g, (match, prefix) => `${prefix}\n\n${match.slice(prefix.length).trimStart()}`);
+    output = output.replace(/\n{3,}/g, '\n\n');
+    return output;
+  }
+
+  function preserveRenderBoundary(match, replacement) {
+    const trailingWhitespaceMatch = String(match || '').match(/((?:\s|&nbsp;|\u00a0|\u2060)*)$/);
+    const trailingWhitespace = trailingWhitespaceMatch ? trailingWhitespaceMatch[1] : '';
+    const normalizedTrailing = trailingWhitespace
+      .replace(/&nbsp;|\u00a0|\u2060/g, ' ')
+      .replace(/[ \t]+\n/g, '\n');
+
+    if (!normalizedTrailing) return replacement;
+    if (normalizedTrailing.includes('\n\n')) return `${replacement}\n\n`;
+    if (normalizedTrailing.includes('\n')) return `${replacement}\n`;
+    return `${replacement} `;
+  }
+
+  function renderExactGrokCards(rawMessage, rendering) {
+    const message = String(rawMessage || '');
+    if (!message || !rendering || typeof rendering !== 'object') return message;
+    const cardMap = parseRenderingCards(rendering);
+    if (!cardMap.size) return message;
+
+    let rendered = message.replace(
+      /(?:<grok:render\b[^>]*card_id="[^"]+"[^>]*>[\s\S]*?<\/grok:render>(?:\s|&nbsp;|\u00a0|\u2060)*)+/g,
+      (match) => {
+        const ids = Array.from(match.matchAll(/card_id="([^"]+)"/g))
+          .map((part) => String(part[1] || '').trim())
+          .filter(Boolean);
+        if (!ids.length) return '';
+
+        const output = [];
+        let pendingCitations = [];
+        const flushCitations = () => {
+          if (!pendingCitations.length) return;
+          output.push(buildInlineCitationChip(pendingCitations));
+          pendingCitations = [];
+        };
+
+        ids.forEach((id) => {
+          const card = cardMap.get(id);
+          if (!card) return;
+          if (String(card.type || '') === 'render_inline_citation' && card.url) {
+            pendingCitations.push({
+              href: String(card.url).trim(),
+              hostname: getSourceHostname(card.url),
+              label: normalizeSourceText(card.title || '') || getSourceHostname(card.url) || String(card.url).trim()
+            });
+            return;
+          }
+          flushCitations();
+          if (String(card.type || '') === 'render_searched_image') {
+            output.push(buildRenderedImageMarkdown(card));
+          }
+        });
+
+        flushCitations();
+        return preserveRenderBoundary(match, output.join(''));
+      }
+    );
+
+    const extraImages = Array.isArray(rendering.extraImages) ? rendering.extraImages : [];
+    if (extraImages.length) {
+      const appended = extraImages
+        .map((url) => String(url || '').trim())
+        .filter(Boolean)
+        .map((url) => `\n![image](${url})\n`)
+        .join('');
+      if (appended) rendered += appended;
+    }
+
+    return normalizeRenderedMarkdownLayout(rendered);
+  }
+
+  function extractThinkMarkup(raw) {
+    const source = String(raw || '');
+    if (!source.includes('<think>')) return '';
+    const matches = source.match(/<think>[\s\S]*?<\/think>|<think>[\s\S]*$/g) || [];
+    return matches.join('\n');
+  }
+
+  function getRenderableAssistantText(entry) {
+    if (!entry || entry.role !== 'assistant') {
+      return entry && entry.raw ? entry.raw : '';
+    }
+    const rendering = entry.rendering && typeof entry.rendering === 'object' ? entry.rendering : null;
+    const rawModelResponse = rendering && rendering.rawModelResponse && typeof rendering.rawModelResponse === 'object'
+      ? rendering.rawModelResponse
+      : null;
+    const rawMessage = rawModelResponse && typeof rawModelResponse.message === 'string'
+      ? rawModelResponse.message
+      : '';
+    if (!rawMessage) return entry.raw || '';
+    const renderedAnswer = renderExactGrokCards(rawMessage, rendering);
+    const thinkMarkup = extractThinkMarkup(entry.raw || '');
+    if (!thinkMarkup) return renderedAnswer;
+    return `${thinkMarkup}\n\n${renderedAnswer}`.trim();
   }
 
   function renderInlineCitationTokens(value, htmlLinks) {
@@ -612,134 +783,17 @@
         links.push(item);
       });
       if (!links.length) return '';
-      const grouped = [];
-      let currentGroup = [];
-      let currentKey = '';
-      links.forEach((item) => {
-        const key = normalizeSourceText(item.hostname || item.href || '');
-        if (!currentGroup.length || key === currentKey) {
-          currentGroup.push(item);
-          currentKey = key;
-          return;
-        }
-        grouped.push(currentGroup);
-        currentGroup = [item];
-        currentKey = key;
-      });
-      if (currentGroup.length) grouped.push(currentGroup);
-      return grouped.map((group) => buildInlineCitationChip(group)).join('');
-    });
-  }
-
-  function buildStructuredSourceCandidates(sources) {
-    const candidates = [];
-    const seen = new Set();
-    const citations = Array.isArray(sources && sources.citations) ? sources.citations : [];
-    const groups = Array.isArray(sources && sources.groups) ? sources.groups : [];
-
-    const pushCandidate = (item) => {
-      const href = String(item && item.url || '').trim();
-      if (!href || seen.has(href)) return;
-      seen.add(href);
-      const hostname = getSourceHostname(href);
-      const label = normalizeSourceText(item && item.title || '') || hostname || href;
-      const preview = normalizeSourceText(item && item.preview || '');
-      candidates.push({ href, hostname, label, preview });
-    };
-
-    citations.forEach(pushCandidate);
-    groups.forEach((group) => {
-      const results = Array.isArray(group && group.results) ? group.results : [];
-      results.forEach(pushCandidate);
-    });
-
-    return candidates;
-  }
-
-  function extractCitationTerms(value) {
-    return (String(value || '').toLowerCase().match(/[a-z0-9][a-z0-9.-]{2,}|[\u4e00-\u9fff]{2,}/g) || [])
-      .map((term) => term.trim())
-      .filter((term) => term && !/^(模型|图片|图像|生成|支持|能力|介绍|版本|官方|页面|blog)$/.test(term));
-  }
-
-  function scoreSourceForText(text, candidate) {
-    const haystack = normalizeSourceText(text || '').toLowerCase();
-    if (!haystack) return 0;
-    const terms = [
-      ...extractCitationTerms(candidate && candidate.label || ''),
-      ...extractCitationTerms(candidate && candidate.preview || '')
-    ];
-    let score = 0;
-    const seen = new Set();
-    terms.forEach((term) => {
-      if (!term || seen.has(term)) return;
-      seen.add(term);
-      if (haystack.includes(term)) {
-        score += term.length >= 6 ? 3 : 2;
+      if (links.every((item) => typeof item.html === 'string' && item.html.trim())) {
+        return links.map((item) => item.html).join('');
       }
+      return buildInlineCitationChip(links);
     });
-    const hostname = String(candidate && candidate.hostname || '').toLowerCase();
-    if (hostname && haystack.includes(hostname.replace(/\.[a-z]+$/, ''))) {
-      score += 2;
-    }
-    return score;
-  }
-
-  function buildStructuredInlineCitationHtml(items) {
-    const group = Array.isArray(items) ? items.filter(Boolean) : [];
-    if (!group.length) return '';
-    return buildInlineCitationChip(group);
-  }
-
-  function applyStructuredInlineCitations(root, sources) {
-    if (!root || !sources || typeof sources !== 'object') return;
-    if (root.querySelector('.inline-citation-chip')) return;
-
-    const candidates = buildStructuredSourceCandidates(sources);
-    if (!candidates.length) return;
-
-    const blocks = Array.from(root.querySelectorAll('p, li'))
-      .filter((node) => node instanceof HTMLElement)
-      .filter((node) => !node.querySelector('.inline-citation-chip'))
-      .map((node) => ({ node, text: normalizeSourceText(node.textContent || '') }))
-      .filter((item) => item.text.length >= 24);
-
-    if (!blocks.length) return;
-
-    const used = new Set();
-    blocks.forEach(({ node, text }) => {
-      let best = null;
-      let bestScore = 0;
-      candidates.forEach((candidate) => {
-        if (used.has(candidate.href)) return;
-        const score = scoreSourceForText(text, candidate);
-        if (score > bestScore) {
-          bestScore = score;
-          best = candidate;
-        }
-      });
-      if (!best || bestScore < 2) return;
-      used.add(best.href);
-      const html = buildStructuredInlineCitationHtml([best]);
-      if (html) {
-        node.insertAdjacentHTML('beforeend', html);
-      }
-    });
-
-    if (!used.size) {
-      const fallback = blocks[0] && blocks[0].node;
-      const html = buildStructuredInlineCitationHtml([candidates[0]]);
-      if (fallback && html) {
-        fallback.insertAdjacentHTML('beforeend', html);
-      }
-    }
   }
 
   function renderBasicMarkdown(rawText) {
     const text = (rawText || '').replace(/\\n/g, '\n');
     const htmlLinks = [];
-    const normalizedText = text
-      .replace(/<\/?span\b[^>]*>/gi, '')
+    const linkExtractedText = text
       .replace(/<a\b[^>]*href=(["'])(.*?)\1[^>]*>([\s\S]*?)<\/a>/gi, (match, quote, href, inner) => {
         const label = String(inner || '')
           .replace(/<[^>]+>/g, ' ')
@@ -751,10 +805,12 @@
         htmlLinks.push({
           href: String(href || '').trim(),
           label,
-          hostname: getSourceHostname(href)
+          hostname: getSourceHostname(href),
+          html: match
         });
         return token;
       });
+    const normalizedText = linkExtractedText.replace(/<\/?span\b[^>]*>/gi, '');
     const escaped = escapeHtml(normalizedText);
     const codeBlocks = [];
     const fenced = escaped.replace(/```([a-zA-Z0-9_-]+)?\n([\s\S]*?)```/g, (match, lang, code) => {
@@ -788,8 +844,27 @@
       });
 
       output = renderInlineCitationTokens(output, htmlLinks);
+      output = linkifyPlainTextSegments(output);
 
       return output;
+    };
+
+    const linkifyPlainTextSegments = (html) => {
+      const segments = String(html || '').split(/(<[^>]+>)/g);
+      return segments.map((segment) => {
+        if (!segment || segment.startsWith('<')) return segment;
+        return segment.replace(/https?:\/\/[A-Za-z0-9\-._~:/?#\[\]@!$&'*+,;=%]+/gi, (rawUrl) => {
+          let url = rawUrl;
+          let trailing = '';
+          while (/[),.;!?，。；：！？）\]]$/.test(url)) {
+            trailing = url.slice(-1) + trailing;
+            url = url.slice(0, -1);
+          }
+          if (!url) return rawUrl;
+          const safeUrl = escapeHtml(url);
+          return `<a href="${safeUrl}" target="_blank" rel="noopener">${safeUrl}</a>${escapeHtml(trailing)}`;
+        });
+      }).join('');
     };
 
     const lines = fenced.split(/\r?\n/);
@@ -820,7 +895,19 @@
     const flushParagraph = () => {
       if (!paragraphLines.length) return;
       const joined = paragraphLines.join('<br>');
-      htmlParts.push(`<p>${renderInline(joined)}</p>`);
+      const standaloneMediaLines = paragraphLines.every((line) => {
+        const trimmed = String(line || '').trim();
+        if (!trimmed) return false;
+        return (
+          /^!\[[^\]]*\]\([^)]+\)$/.test(trimmed) ||
+          /^\[[^\]]+\]\((https?:\/\/[^)]+)\)$/.test(trimmed)
+        );
+      });
+      if (standaloneMediaLines) {
+        htmlParts.push(paragraphLines.map((line) => renderInline(line.trim())).join(''));
+      } else {
+        htmlParts.push(`<p>${renderInline(joined)}</p>`);
+      }
       paragraphLines = [];
     };
 
@@ -1142,6 +1229,7 @@
       role,
       raw: content || '',
       sources: null,
+      rendering: null,
       committed: false,
       startedAt: Date.now(),
       firstTokenAt: null,
@@ -1379,6 +1467,10 @@
     if (!entry) return;
     entry.raw = content || '';
     if (!entry.contentNode) return;
+    if (entry.role === 'user') {
+      renderUserMessage(entry, entry.raw, []);
+      return;
+    }
     const shouldPreserveScroll = isSending && !followStreamScroll;
     const scrollContainer = shouldPreserveScroll ? getScrollContainer() : null;
     const preservedScrollTop = scrollContainer ? scrollContainer.scrollTop : 0;
@@ -1423,12 +1515,13 @@
     if (!entry.hasThink && entry.raw.includes('<think>')) {
       entry.hasThink = true;
     }
+    const renderText = entry.role === 'assistant' ? getRenderableAssistantText(entry) : entry.raw;
     if (finalize) {
       entry.contentNode.classList.add('rendered');
-      entry.contentNode.innerHTML = renderMarkdown(entry.raw);
+      entry.contentNode.innerHTML = renderMarkdown(renderText);
     } else {
       if (entry.role === 'assistant') {
-        entry.contentNode.innerHTML = renderMarkdown(entry.raw);
+        entry.contentNode.innerHTML = renderMarkdown(renderText);
       } else {
         entry.contentNode.textContent = entry.raw;
       }
@@ -1448,13 +1541,11 @@
       updateThinkSummary(entry, entry.thinkElapsed);
     }
     if (entry.role === 'assistant' || entry.role === 'user') {
-      if (entry.role === 'assistant') {
-        applyStructuredInlineCitations(entry.contentNode, entry.sources);
-      }
       liftThinkImages(entry.contentNode);
       applyImageGrid(entry.contentNode);
       enhanceBrokenImages(entry.contentNode);
       bindMessageImagePreview(entry.contentNode);
+      bindInlineCitationExpand(entry.contentNode);
     }
     if (entry.role === 'assistant') {
       bindCodeCopyButtons(entry.contentNode);
@@ -1514,14 +1605,25 @@
     const summaries = entry.contentNode.querySelectorAll('.think-summary');
     if (!summaries.length) return;
     const text = typeof elapsedSec === 'number' ? `思考 ${elapsedSec} 秒` : '思考中';
+    const spinDurationMs = 5500;
+    const elapsedMs = Math.max(0, Date.now() - (entry.startedAt || Date.now()));
+    const spinOffset = `-${(elapsedMs % spinDurationMs)}ms`;
     summaries.forEach((node) => {
       node.textContent = text;
       const block = node.closest('.think-block');
       if (!block) return;
       if (typeof elapsedSec === 'number') {
         block.removeAttribute('data-thinking');
+        node.style.removeProperty('--think-spin-delay');
+        block.querySelectorAll('.think-agent summary').forEach((summary) => {
+          summary.style.removeProperty('--think-spin-delay');
+        });
       } else {
         block.setAttribute('data-thinking', 'true');
+        node.style.setProperty('--think-spin-delay', spinOffset);
+        block.querySelectorAll('.think-agent summary').forEach((summary) => {
+          summary.style.setProperty('--think-spin-delay', spinOffset);
+        });
       }
     });
   }
@@ -1541,6 +1643,19 @@
   function getSourceFavicon(hostname) {
     if (!hostname) return '';
     return `https://www.google.com/s2/favicons?domain=${encodeURIComponent(hostname)}&sz=256`;
+  }
+
+  function bindInlineCitationExpand(root) {
+    if (!root || root.dataset.citationExpandBound === '1') return;
+    root.dataset.citationExpandBound = '1';
+    root.addEventListener('click', (event) => {
+      const target = event.target instanceof Element ? event.target.closest('.inline-citation-cluster.inline-citation-chip') : null;
+      if (!(target instanceof HTMLElement)) return;
+      if (target.dataset.expanded === '1') return;
+      event.preventDefault();
+      event.stopPropagation();
+      expandInlineCitationCluster(target);
+    });
   }
 
   function cleanExtractedUrl(url) {
@@ -1629,6 +1744,10 @@
     const structured = entry && entry.sources && typeof entry.sources === 'object' ? entry.sources : null;
     const groups = Array.isArray(structured && structured.groups) ? structured.groups : [];
     const citations = Array.isArray(structured && structured.citations) ? structured.citations : [];
+    const rawSourceCount = citations.length + groups.reduce((sum, group) => {
+      const results = Array.isArray(group && group.results) ? group.results : [];
+      return sum + results.length;
+    }, 0);
     const data = (!groups.length && !citations.length)
       ? extractAssistantSources(entry && entry.contentNode)
       : { links: [], searches: [] };
@@ -1645,6 +1764,7 @@
         type: 'citation',
         label: hostname || url,
         meta: '引用来源',
+        preview: normalizeSourceText(item && item.preview || ''),
         url,
         hostname
       });
@@ -1669,6 +1789,7 @@
           type: 'visit',
           label: normalizeSourceText(item && item.title || '') || hostname || url,
           meta: hostname || '搜索结果',
+          preview: normalizeSourceText(item && item.preview || ''),
           url,
           hostname
         });
@@ -1682,7 +1803,7 @@
 
     const summary = document.createElement('summary');
     summary.className = 'sources-chip';
-    const summaryCount = sources.length || searches.length;
+    const summaryCount = rawSourceCount || sources.length || searches.length;
     const summaryLabel = sources.length ? `${summaryCount} sources` : `${summaryCount} searches`;
     summary.setAttribute('aria-label', summaryLabel);
 
@@ -1721,12 +1842,54 @@
     const panel = document.createElement('div');
     panel.className = 'sources-panel';
 
-    if (sources.length) {
-      const title = document.createElement('div');
-      title.className = 'sources-section-title';
-      title.textContent = '可验证来源';
-      panel.appendChild(title);
-    }
+    const panelHeader = document.createElement('div');
+    panelHeader.className = 'sources-panel-header';
+
+    const panelHeading = document.createElement('div');
+    panelHeading.className = 'sources-section-title sources-panel-heading';
+    panelHeading.textContent = '可验证来源';
+
+    const closeButton = document.createElement('button');
+    closeButton.type = 'button';
+    closeButton.className = 'sources-panel-close';
+    closeButton.setAttribute('aria-label', '关闭来源面板');
+    closeButton.textContent = '×';
+    closeButton.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      wrapper.open = false;
+    });
+
+    panelHeader.appendChild(panelHeading);
+    panelHeader.appendChild(closeButton);
+    panel.appendChild(panelHeader);
+
+    const sectionAnchors = [];
+    const registerSectionAnchor = (labelText) => {
+      const anchor = document.createElement('div');
+      anchor.className = 'sources-section-anchor';
+      anchor.dataset.sectionLabel = labelText;
+      panel.appendChild(anchor);
+      sectionAnchors.push(anchor);
+      return anchor;
+    };
+
+    const updatePanelHeading = () => {
+      if (!sectionAnchors.length) return;
+      const headerHeight = panelHeader.offsetHeight || 0;
+      const threshold = panel.scrollTop + headerHeight + 8;
+      let activeLabel = sectionAnchors[0].dataset.sectionLabel || '';
+      sectionAnchors.forEach((anchor) => {
+        if (anchor.offsetTop <= threshold) {
+          activeLabel = anchor.dataset.sectionLabel || activeLabel;
+        }
+      });
+      if (activeLabel) {
+        panelHeading.textContent = activeLabel;
+      }
+    };
+
+    registerSectionAnchor('可验证来源');
 
     sources.forEach((item) => {
       const row = document.createElement(item.url ? 'a' : 'div');
@@ -1760,14 +1923,21 @@
       title.className = 'source-row-title';
       title.textContent = item.label || item.url || '';
 
-      textWrap.appendChild(meta);
       textWrap.appendChild(title);
+      if (item.preview) {
+        const preview = document.createElement('span');
+        preview.className = 'source-row-preview';
+        preview.textContent = item.preview;
+        textWrap.appendChild(preview);
+      }
+      textWrap.appendChild(meta);
       row.appendChild(icon);
       row.appendChild(textWrap);
       panel.appendChild(row);
     });
 
     if (searches.length) {
+      registerSectionAnchor('搜索轨迹');
       const title = document.createElement('div');
       title.className = 'sources-section-title';
       title.textContent = '搜索轨迹';
@@ -1802,6 +1972,12 @@
 
     wrapper.appendChild(summary);
     wrapper.appendChild(panel);
+    panel.addEventListener('scroll', updatePanelHeading, { passive: true });
+    wrapper.addEventListener('toggle', () => {
+      if (wrapper.open) {
+        updatePanelHeading();
+      }
+    });
     return wrapper;
   }
 
@@ -2268,9 +2444,9 @@
         if (!assistantEntry.committed) {
           assistantEntry.committed = true;
           if (retrySessionId) {
-            commitToSession(retrySessionId, assistantEntry.raw || '', assistantEntry.sources);
+            commitToSession(retrySessionId, assistantEntry.raw || '', assistantEntry.sources, assistantEntry.rendering);
           } else {
-            messageHistory.push({ role: 'assistant', content: assistantEntry.raw || '', sources: assistantEntry.sources || null });
+            messageHistory.push({ role: 'assistant', content: assistantEntry.raw || '', sources: assistantEntry.sources || null, rendering: assistantEntry.rendering || null });
           }
         }
         setStatus('error', '已中止');
@@ -2363,9 +2539,9 @@
         if (!assistantEntry.committed) {
           assistantEntry.committed = true;
           if (sendSessionId) {
-            commitToSession(sendSessionId, assistantEntry.raw || '', assistantEntry.sources);
+            commitToSession(sendSessionId, assistantEntry.raw || '', assistantEntry.sources, assistantEntry.rendering);
           } else {
-            messageHistory.push({ role: 'assistant', content: assistantEntry.raw || '', sources: assistantEntry.sources || null });
+            messageHistory.push({ role: 'assistant', content: assistantEntry.raw || '', sources: assistantEntry.sources || null, rendering: assistantEntry.rendering || null });
           }
         }
       } else {
@@ -2380,14 +2556,15 @@
     }
   }
 
-  function commitToSession(sessionId, assistantText, assistantSources = null) {
+  function commitToSession(sessionId, assistantText, assistantSources = null, assistantRendering = null) {
     if (!sessionId || !sessionsData) return;
     const session = sessionsData.sessions.find((s) => s.id === sessionId);
     if (!session) return;
     session.messages.push({
       role: 'assistant',
       content: assistantText,
-      sources: assistantSources || null
+      sources: assistantSources || null,
+      rendering: assistantRendering || null
     });
     if (session.messages.length > MAX_CONTEXT_MESSAGES) {
       session.messages = session.messages.slice(-MAX_CONTEXT_MESSAGES);
@@ -2432,9 +2609,9 @@
             }
             assistantEntry.committed = true;
             if (targetSessionId) {
-              commitToSession(targetSessionId, assistantText, assistantEntry.sources);
+              commitToSession(targetSessionId, assistantText, assistantEntry.sources, assistantEntry.rendering);
             } else {
-              messageHistory.push({ role: 'assistant', content: assistantText, sources: assistantEntry.sources || null });
+              messageHistory.push({ role: 'assistant', content: assistantText, sources: assistantEntry.sources || null, rendering: assistantEntry.rendering || null });
             }
             return;
           }
@@ -2442,11 +2619,14 @@
             const json = JSON.parse(payload);
             if (json && json.sources && typeof json.sources === 'object') {
               assistantEntry.sources = json.sources;
-              if (assistantEntry.contentNode) {
-                applyStructuredInlineCitations(assistantEntry.contentNode, assistantEntry.sources);
-              }
               if (assistantEntry.row && assistantEntry.row.querySelector('.message-actions')) {
                 attachAssistantActions(assistantEntry);
+              }
+            }
+            if (json && json.rendering && typeof json.rendering === 'object') {
+              assistantEntry.rendering = json.rendering;
+              if (!targetSessionId || (sessionsData && sessionsData.activeId === targetSessionId)) {
+                updateMessage(assistantEntry, assistantText, false);
               }
             }
             const delta = json && json.choices && json.choices[0] && json.choices[0].delta
@@ -2479,9 +2659,9 @@
     }
     assistantEntry.committed = true;
     if (targetSessionId) {
-      commitToSession(targetSessionId, assistantText, assistantEntry.sources);
+      commitToSession(targetSessionId, assistantText, assistantEntry.sources, assistantEntry.rendering);
     } else {
-      messageHistory.push({ role: 'assistant', content: assistantText, sources: assistantEntry.sources || null });
+      messageHistory.push({ role: 'assistant', content: assistantText, sources: assistantEntry.sources || null, rendering: assistantEntry.rendering || null });
     }
     } finally {
       activeStreamInfo = null;
